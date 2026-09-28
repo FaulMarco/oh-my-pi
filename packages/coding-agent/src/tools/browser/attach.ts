@@ -478,32 +478,50 @@ async function enrichPages(pages: Page[]): Promise<Array<{ page: Page; url: stri
 }
 
 async function pickPageFromList(pages: Page[], options: { matcher?: string; preferVisible?: boolean }): Promise<Page> {
-	const enriched = await enrichPages(pages);
+	return await pickTargetCandidate(await enrichPages(pages), options, async page => {
+		// Best-effort foreground probe; a tab that cannot answer counts as hidden.
+		try {
+			return (await page.evaluate(() => document.visibilityState === "visible")) === true;
+		} catch {
+			return false;
+		}
+	});
+}
+
+/** A pickable target: the page handle (or target id) plus the url/title the matcher reads. */
+export interface TargetCandidate<T> {
+	page: T;
+	url: string;
+	title: string;
+}
+
+/**
+ * Shared attach-target choice: `matcher` is a url/title substring (throws
+ * listing the candidates on a miss); otherwise skip helper targets and, with
+ * `preferVisible`, take the first candidate `isVisible` reports foregrounded.
+ */
+export async function pickTargetCandidate<T>(
+	candidates: Array<TargetCandidate<T>>,
+	options: { matcher?: string; preferVisible?: boolean },
+	isVisible: (page: T) => boolean | Promise<boolean>,
+): Promise<T> {
+	if (candidates.length === 0) throw new ToolError("No page targets available on the attached browser");
 	if (options.matcher) {
 		const needle = options.matcher.toLowerCase();
-		const hit = enriched.find(p => p.url.toLowerCase().includes(needle) || p.title.toLowerCase().includes(needle));
+		const hit = candidates.find(p => p.url.toLowerCase().includes(needle) || p.title.toLowerCase().includes(needle));
 		if (hit) return hit.page;
-		const summary = enriched.map(p => `- ${p.title || "(untitled)"}  ${p.url}`).join("\n");
+		const summary = candidates.map(p => `- ${p.title || "(untitled)"}  ${p.url}`).join("\n");
 		throw new ToolError(`No page target matched ${JSON.stringify(options.matcher)}. Available pages:\n${summary}`);
 	}
-	const usable = enriched.filter(
+	const usable = candidates.filter(
 		p => !ATTACH_TARGET_SKIP_PATTERN.test(p.url) && !ATTACH_TARGET_SKIP_PATTERN.test(p.title),
 	);
 	if (options.preferVisible && usable.length > 1) {
-		// Best-effort foreground probe; a tab that cannot answer counts as hidden.
-		const visibility = await Promise.all(
-			usable.map(async p => {
-				try {
-					return (await p.page.evaluate(() => document.visibilityState === "visible")) === true;
-				} catch {
-					return false;
-				}
-			}),
-		);
+		const visibility = await Promise.all(usable.map(p => isVisible(p.page)));
 		const foreground = visibility.indexOf(true);
 		if (foreground >= 0) return usable[foreground]!.page;
 	}
-	return usable[0]?.page ?? enriched[0]!.page;
+	return usable[0]?.page ?? candidates[0]!.page;
 }
 
 /**

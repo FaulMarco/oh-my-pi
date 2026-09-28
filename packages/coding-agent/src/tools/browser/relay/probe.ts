@@ -13,7 +13,7 @@
  *   whole window every call.
  */
 import { throwIfAborted } from "../../tool-errors";
-import { probeCdpResponse } from "../attach";
+import { probeCdpResponse, pickTargetCandidate } from "../attach";
 import type { RelayUnavailableInfo } from "./server";
 
 /**
@@ -76,4 +76,78 @@ export async function waitForRelayExtension(cdpUrl: string, signal?: AbortSignal
 		if (Date.now() >= deadline) return "no-extension";
 		await Bun.sleep(POLL_INTERVAL_MS);
 	}
+}
+
+/**
+ * Scope a relay `/cdp` websocket URL: the connection auto-attaches only the
+ * `claims` target ids instead of every tab in the user's browser. Relays
+ * predating scoping ignore the query and attach everything, as before.
+ */
+export function scopedRelayEndpoint(wsEndpoint: string, claims: readonly string[] = []): string {
+	const url = new URL(wsEndpoint);
+	url.searchParams.set("scope", "claimed");
+	url.searchParams.delete("claim");
+	for (const targetId of claims) url.searchParams.append("claim", targetId);
+	return url.toString();
+}
+
+/** Scoped `/cdp` endpoint advertised by the relay's `/json/version`, or null when unreadable. */
+export async function resolveScopedRelayEndpoint(cdpUrl: string, signal?: AbortSignal): Promise<string | null> {
+	const response = await probeCdpResponse(`${cdpUrl}/json/version`, { timeoutMs: PROBE_TIMEOUT_MS, signal });
+	if (!response || response.status < 200 || response.status >= 300) return null;
+	try {
+		const parsed: unknown = JSON.parse(response.body);
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			"webSocketDebuggerUrl" in parsed &&
+			typeof parsed.webSocketDebuggerUrl === "string"
+		) {
+			return scopedRelayEndpoint(parsed.webSocketDebuggerUrl);
+		}
+	} catch {
+		// Malformed body: caller falls back to a plain connect.
+	}
+	return null;
+}
+
+/**
+ * Pick the target id to drive from the relay's `/json/list` without attaching
+ * any tab, using the same matcher semantics as `pickElectronTarget`; the
+ * relay-reported `active` flag stands in for the visibility probe. Returns
+ * null when the relay predates the `active` field (callers fall back to the
+ * puppeteer-based picker).
+ */
+export async function pickRelayTarget(
+	cdpUrl: string,
+	options: { matcher?: string; preferVisible?: boolean },
+	signal?: AbortSignal,
+): Promise<string | null> {
+	const response = await probeCdpResponse(`${cdpUrl}/json/list`, { timeoutMs: PROBE_TIMEOUT_MS, signal });
+	if (!response || response.status < 200 || response.status >= 300) return null;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(response.body);
+	} catch {
+		return null;
+	}
+	if (!Array.isArray(parsed)) return null;
+	const candidates: Array<{ page: { id: string; active: boolean }; url: string; title: string }> = [];
+	for (const entry of parsed) {
+		if (
+			typeof entry !== "object" ||
+			entry === null ||
+			typeof entry.id !== "string" ||
+			typeof entry.active !== "boolean"
+		) {
+			return null;
+		}
+		candidates.push({
+			page: { id: entry.id, active: entry.active },
+			url: typeof entry.url === "string" ? entry.url : "",
+			title: typeof entry.title === "string" ? entry.title.trim() : "",
+		});
+	}
+	const picked = await pickTargetCandidate(candidates, options, target => target.active);
+	return picked.id;
 }

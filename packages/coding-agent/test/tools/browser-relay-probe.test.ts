@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
-import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
+import { pickRelayTarget, waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
 import {
 	type RelayServer,
 	type RelayUnavailableInfo,
@@ -61,5 +61,35 @@ describe("waitForRelayExtension", () => {
 		extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
 		extension.addEventListener("open", () => extension?.send(JSON.stringify(EXTENSION_HELLO)), { once: true });
 		expect(await wait).toBe("ready");
+	});
+});
+
+describe("pickRelayTarget", () => {
+	let fake: Bun.Server<undefined> | undefined;
+
+	afterEach(() => {
+		fake?.stop(true);
+		fake = undefined;
+	});
+
+	function serveList(list: unknown[]): string {
+		fake = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(list) });
+		return `http://127.0.0.1:${fake.port}`;
+	}
+
+	it("prefers the relay-reported foreground tab and honors an explicit matcher", async () => {
+		const cdpUrl = serveList([
+			{ id: "PAGEx.1", type: "page", title: "Docs", url: "https://docs.example/", active: false },
+			{ id: "PAGEx.2", type: "page", title: "Mail", url: "https://mail.example/", active: true },
+		]);
+		expect(await pickRelayTarget(cdpUrl, { preferVisible: true })).toBe("PAGEx.2");
+		expect(await pickRelayTarget(cdpUrl, { preferVisible: false })).toBe("PAGEx.1");
+		expect(await pickRelayTarget(cdpUrl, { matcher: "docs" })).toBe("PAGEx.1");
+		await expect(pickRelayTarget(cdpUrl, { matcher: "nope" })).rejects.toThrow("Available pages");
+	});
+
+	it("returns null for relays that predate the active flag", async () => {
+		const cdpUrl = serveList([{ id: "PAGEx.1", type: "page", title: "Docs", url: "https://docs.example/" }]);
+		expect(await pickRelayTarget(cdpUrl, { preferVisible: true })).toBeNull();
 	});
 });

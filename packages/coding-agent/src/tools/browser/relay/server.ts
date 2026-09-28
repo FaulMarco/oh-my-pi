@@ -6,8 +6,10 @@
  * - `GET /json/version` → 200 with `webSocketDebuggerUrl` once the extension
  *   is connected, 503 with a {@link RelayUnavailableInfo} body before that
  *   (`waitForRelayExtension` decides from it whether polling is worthwhile).
- * - `GET /json` / `/json/list` → attachable page targets (debugging aid).
- * - `WS /cdp` → downstream CDP clients (puppeteer).
+ * - `GET /json` / `/json/list` → attachable page targets, with `active` for
+ *   the foreground tab (lets clients pick a tab without attaching).
+ * - `WS /cdp` → downstream CDP clients (puppeteer). `?scope=claimed` limits
+ *   auto-attach to claimed tabs; `claim=<targetId>` (repeatable) pre-claims.
  * - `WS /ext` → the Chrome extension (token-gated when configured).
  *
  * Binds loopback only: anything that can reach this port can drive the
@@ -44,6 +46,9 @@ export interface RelayServer {
 interface SocketData {
 	role: "cdp" | "ext";
 	connId?: number;
+	/** `/cdp?scope=claimed&claim=<targetId>…`: auto-attach only claimed tabs. */
+	scoped?: boolean;
+	claims?: string[];
 }
 
 type RelayWebSocket = Bun.ServerWebSocket<SocketData>;
@@ -90,7 +95,11 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				// Browsers set Origin on websocket upgrades; native CDP clients
 				// don't. Reject any Origin so a web page can't drive the relay.
 				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
-				const data: SocketData = { role: "cdp" };
+				const data: SocketData = {
+					role: "cdp",
+					scoped: url.searchParams.get("scope") === "claimed",
+					claims: url.searchParams.getAll("claim").flatMap(value => value.split(",")),
+				};
 				if (srv.upgrade(req, { data })) return undefined;
 				return new Response("websocket upgrade required", { status: 426 });
 			}
@@ -133,7 +142,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				if (ws.data.role === "ext") {
 					bridge.extConnected(ws);
 				} else {
-					ws.data.connId = bridge.cdpConnected(ws);
+					ws.data.connId = bridge.cdpConnected(ws, { scoped: ws.data.scoped, claims: ws.data.claims });
 				}
 			},
 			message(ws: RelayWebSocket, message: string | Buffer): void {

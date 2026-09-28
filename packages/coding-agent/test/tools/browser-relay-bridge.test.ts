@@ -1070,3 +1070,95 @@ describe("RelayBridge last-hello fallback and offline instance pruning", () => {
 		expect(bridge.listTargets().map(t => t.title)).toEqual(["Chrome tab", "Edge tab"]);
 	});
 });
+
+/** Tab ids whose `Target.attachedToTarget` (tab target) reached this connection. */
+function attachedTabIds(cdp: FakeCdpSocket): number[] {
+	const out: number[] = [];
+	for (const msg of cdp.messages) {
+		if (msg.method !== "Target.attachedToTarget") continue;
+		const info = (msg.params as { targetInfo: { targetId: string } }).targetInfo;
+		out.push(Number(info.targetId.split(".").pop()));
+	}
+	return out.sort((a, b) => a - b);
+}
+
+describe("RelayBridge scoped connections", () => {
+	it("auto-attaches only claimed tabs on a scoped connection, every eligible tab on an unscoped one", async () => {
+		const tabs = [tab({ tabId: 1 }), tab({ tabId: 2 }), tab({ tabId: 3 })];
+		const scopedBridge = new RelayBridge({});
+		const scopedExt = new FakeExtSocket();
+		connect(scopedBridge, scopedExt, tabs);
+		const scoped = new FakeCdpSocket();
+		const scopedConn = scopedBridge.cdpConnected(scoped, { scoped: true, claims: [`PAGE${ANON}.2`, "bogus"] });
+		scopedBridge.cdpMessage(scopedConn, JSON.stringify({ id: 1, method: "Target.setAutoAttach" }));
+		await flush();
+		expect(scopedExt.rpcs("attach").map(rpc => rpc.tabId)).toEqual([2]);
+		ack(scopedBridge, scopedExt, "attach");
+		await flush();
+		expect(attachedTabIds(scoped)).toEqual([2]);
+
+		const plainBridge = new RelayBridge({});
+		const plainExt = new FakeExtSocket();
+		connect(plainBridge, plainExt, tabs);
+		const plain = new FakeCdpSocket();
+		const plainConn = plainBridge.cdpConnected(plain);
+		plainBridge.cdpMessage(plainConn, JSON.stringify({ id: 1, method: "Target.setAutoAttach" }));
+		await flush();
+		expect(plainExt.rpcs("attach").map(rpc => rpc.tabId)).toEqual([1, 2, 3]);
+		ack(plainBridge, plainExt, "attach");
+		await flush();
+		expect(attachedTabIds(plain)).toEqual([1, 2, 3]);
+	});
+
+	it("auto-attaches a tab the user opens only to unscoped connections", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const scoped = new FakeCdpSocket();
+		const scopedConn = bridge.cdpConnected(scoped, { scoped: true });
+		const plain = new FakeCdpSocket();
+		const plainConn = bridge.cdpConnected(plain);
+		bridge.cdpMessage(scopedConn, JSON.stringify({ id: 1, method: "Target.setAutoAttach" }));
+		bridge.cdpMessage(plainConn, JSON.stringify({ id: 1, method: "Target.setAutoAttach" }));
+		await flush();
+		bridge.extMessage(ext, JSON.stringify({ t: "tabCreated", tab: tab({ tabId: 9 }) }));
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(attachedTabIds(plain)).toEqual([9]);
+		expect(attachedTabIds(scoped)).toEqual([]);
+	});
+
+	it("attaches a tab created through Target.createTarget on a scoped connection before replying", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp, { scoped: true });
+		bridge.cdpMessage(connId, JSON.stringify({ id: 1, method: "Target.setAutoAttach" }));
+		await flush();
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: 2, method: "Target.createTarget", params: { url: "about:blank" } }),
+		);
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9, url: "about:blank" }) });
+		await flush();
+		expect(ext.rpcs("attach").map(rpc => rpc.tabId)).toEqual([9]);
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(attachedTabIds(cdp)).toEqual([9]);
+		const attachedAt = cdp.messages.findIndex(msg => msg.method === "Target.attachedToTarget");
+		const replyAt = cdp.messages.findIndex(msg => msg.id === 2);
+		expect(replyAt).toBeGreaterThan(attachedAt);
+		expect(cdp.messages[replyAt]!.result).toEqual({ targetId: `PAGE${ANON}.9` });
+	});
+
+	it("reports the foreground tab in /json/list", () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2, active: true })]);
+		expect(bridge.listTargets().map(entry => [entry.id, entry.active])).toEqual([
+			[`PAGE${ANON}.1`, false],
+			[`PAGE${ANON}.2`, true],
+		]);
+	});
+});

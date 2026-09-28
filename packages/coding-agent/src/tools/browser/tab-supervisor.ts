@@ -27,6 +27,7 @@ import {
 	type PuppeteerBrowserHandle,
 	releaseBrowser,
 } from "./registry";
+import { pickRelayTarget, scopedRelayEndpoint } from "./relay/probe";
 import type {
 	ReadyInfo,
 	RunErrorPayload,
@@ -1293,14 +1294,18 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 	// target may be backgrounded, so retain activation for target-correct pixels.
 	const userDriven = browser.kind.kind === "connected" || browser.kind.kind === "relay";
 	const activateForScreenshot = !userDriven || !shouldPreserveConnectedBrowserFocus(opts.target);
-	const page = await pickElectronTarget(browser.browser, {
-		matcher: opts.target,
-		preferVisible: !activateForScreenshot,
-	});
-	const targetId = await targetIdForPage(page);
+	const pickOptions = { matcher: opts.target, preferVisible: !activateForScreenshot };
+	// Relay: pick from `/json/list` so no user tab gets a debugger attached
+	// just to be considered; older relays without `active` use puppeteer pages.
+	const relayTargetId =
+		browser.kind.kind === "relay"
+			? await pickRelayTarget(browser.cdpUrl ?? browser.kind.cdpUrl, pickOptions, opts.signal)
+			: null;
+	const targetId = relayTargetId ?? (await targetIdForPage(await pickElectronTarget(browser.browser, pickOptions)));
 	return {
 		mode: "attach",
-		browserWSEndpoint,
+		browserWSEndpoint:
+			browser.kind.kind === "relay" ? scopedRelayEndpoint(browserWSEndpoint, [targetId]) : browserWSEndpoint,
 		safeDir,
 		targetId,
 		dialogs: opts.dialogs,
@@ -1406,11 +1411,12 @@ async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number
 	const startedAt = performance.now();
 	const oldWorker = tab.worker;
 	await oldWorker.terminate().catch(() => undefined);
-	const browserWSEndpoint = tab.browser.browser.wsEndpoint();
-	if (!browserWSEndpoint) throw new ToolError("Browser websocket endpoint is unavailable");
+	const wsEndpoint = tab.browser.browser.wsEndpoint();
+	if (!wsEndpoint) throw new ToolError("Browser websocket endpoint is unavailable");
 	const payload: WorkerInitPayload = {
 		mode: "attach",
-		browserWSEndpoint,
+		browserWSEndpoint:
+			tab.browser.kind.kind === "relay" ? scopedRelayEndpoint(wsEndpoint, [tab.targetId]) : wsEndpoint,
 		safeDir: getPuppeteerDir(),
 		targetId: tab.targetId,
 		dialogs: tab.dialogPolicy,

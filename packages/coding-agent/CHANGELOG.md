@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed browser relay mode slowing down your everyday Chrome browsing: an omp session now attaches the debugger only to the tab it drives instead of every open tab for the whole session ([#PR](https://github.com/can1357/oh-my-pi/pull/PR) by [@FaulMarco](https://github.com/FaulMarco))
+
 ## [18.4.1] - 2026-09-28
 
 ### Changed

@@ -74,6 +74,11 @@ interface TargetInfo {
 class CdpConnection {
 	discover = false;
 	autoAttach = false;
+	/**
+	 * Scoped connections (`/cdp?scope=claimed`) auto-attach only the tabs they
+	 * claim; discovery still announces every tab (unattached).
+	 */
+	scoped = false;
 	/** Minted pseudo-sessions owned by this connection. */
 	readonly sessions = new Map<string, SessionRef>();
 	/** Tabs this connection claimed as drive targets (`OMP.claimTarget` / `Target.createTarget`). */
@@ -281,12 +286,18 @@ export class RelayBridge {
 		};
 	}
 
-	/** Payload for `GET /json/list` (debugging aid; per-target endpoints are not served). */
-	listTargets(): Array<Record<string, string>> {
-		const out: Array<Record<string, string>> = [];
+	/** Payload for `GET /json/list`; `active` lets clients pick the foreground tab without attaching. */
+	listTargets(): Array<{ id: string; type: "page"; title: string; url: string; active: boolean }> {
+		const out: Array<{ id: string; type: "page"; title: string; url: string; active: boolean }> = [];
 		for (const tab of this.#tabs.values()) {
 			if (!this.#eligible(tab)) continue;
-			out.push({ id: pageTargetIdFromKey(tab.tabKey), type: "page", title: tab.title, url: tab.url });
+			out.push({
+				id: pageTargetIdFromKey(tab.tabKey),
+				type: "page",
+				title: tab.title,
+				url: tab.url,
+				active: tab.active,
+			});
 		}
 		return out;
 	}
@@ -440,11 +451,20 @@ export class RelayBridge {
 
 	// ---- downstream (puppeteer) lifecycle -------------------------------------
 
-	/** Register a downstream CDP websocket; returns the connection id. */
-	cdpConnected(socket: RelaySocket): number {
+	/**
+	 * Register a downstream CDP websocket; returns the connection id.
+	 * `scoped` connections auto-attach only claimed tabs; `claims` are target
+	 * ids (`TAB…`/`PAGE…`) pre-claimed at connect time. Unknown ids are ignored.
+	 */
+	cdpConnected(socket: RelaySocket, opts: { scoped?: boolean; claims?: readonly string[] } = {}): number {
 		const conn = new CdpConnection(++this.#connSeq, socket);
+		conn.scoped = opts.scoped === true;
 		this.#conns.set(conn.id, conn);
-		this.#log("cdp client connected", { conn: conn.id });
+		for (const targetId of opts.claims ?? []) {
+			const parsed = parseTargetId(targetId);
+			if (parsed) this.#claimTab(conn, parsed.key);
+		}
+		this.#log("cdp client connected", { conn: conn.id, scoped: conn.scoped });
 		return conn.id;
 	}
 
@@ -760,7 +780,7 @@ export class RelayBridge {
 			}
 			case "Target.setAutoAttach": {
 				conn.autoAttach = true;
-				const tabs = [...this.#tabs.values()].filter(tab => this.#eligible(tab));
+				const tabs = [...this.#tabs.values()].filter(tab => this.#autoAttachable(conn, tab));
 				await Promise.all(tabs.map(tab => this.#ensureAttached(tab)));
 				for (const tab of tabs) {
 					if (!tab.attached) {
@@ -810,6 +830,13 @@ export class RelayBridge {
 				// Creating a tab is an explicit act of driving it.
 				const createdKey = tabKeyOf(inst.code, result.tab.tabId);
 				this.#claimTab(conn, createdKey);
+				// The upsert's auto-attach pass ran before the claim, so it skipped
+				// this tab for a scoped connection. Attach now and emit before the
+				// reply: puppeteer's newPage waits for the target it announced.
+				const created = this.#tabs.get(createdKey);
+				if (conn.scoped && conn.autoAttach && created && (await this.#ensureAttached(created))) {
+					this.#emitTabAttached(conn, created);
+				}
 				this.#reply(conn, msg, { targetId: pageTargetIdFromKey(createdKey) });
 				return;
 			}
@@ -1011,7 +1038,7 @@ export class RelayBridge {
 				this.#emit(conn, "Target.targetCreated", { targetInfo: this.#pageInfo(tab, tab.attached) });
 			}
 			for (const conn of this.#conns.values()) {
-				if (!conn.autoAttach) continue;
+				if (!conn.autoAttach || !this.#autoAttachable(conn, tab)) continue;
 				void this.#ensureAttached(tab).then(ok => {
 					if (ok) this.#emitTabAttached(conn, tab);
 				});
@@ -1267,6 +1294,11 @@ export class RelayBridge {
 		if (!this.#instances.get(tab.instanceId)?.socket) return false;
 		if (!tab.url) return true;
 		return !INELIGIBLE_URL.test(tab.url);
+	}
+
+	/** Whether `conn`'s auto-attach covers `tab`: scoped connections take only their claims. */
+	#autoAttachable(conn: CdpConnection, tab: TabState): boolean {
+		return this.#eligible(tab) && (!conn.scoped || conn.claims.has(tab.tabKey));
 	}
 
 	#tabInfo(tab: TabState, attached: boolean): TargetInfo {

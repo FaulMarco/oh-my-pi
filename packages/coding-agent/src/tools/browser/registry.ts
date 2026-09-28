@@ -18,7 +18,7 @@ import {
 import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
 import type { RelayKind } from "./relay/kind";
-import { waitForRelayExtension } from "./relay/probe";
+import { resolveScopedRelayEndpoint, waitForRelayExtension } from "./relay/probe";
 import { ensureSharedBrowser } from "./shared-daemon";
 
 export type PuppeteerBrowserKind =
@@ -242,8 +242,11 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			);
 		}
 		const puppeteer = await loadPuppeteer();
+		// Scoped with no claims: the long-lived supervisor handle only discovers
+		// tabs and never attaches `chrome.debugger` to the user's browsing.
+		const scopedEndpoint = await resolveScopedRelayEndpoint(cdpUrl, opts.signal);
 		const browser = await puppeteer.connect({
-			browserURL: cdpUrl,
+			...(scopedEndpoint ? { browserWSEndpoint: scopedEndpoint } : { browserURL: cdpUrl }),
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
